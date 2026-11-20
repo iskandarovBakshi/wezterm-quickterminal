@@ -84,6 +84,10 @@ namespace WeztermQuickTerminal
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string title);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hwnd, StringBuilder text, int max);
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc proc, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder cls, int max);
+        [DllImport("user32.dll")] public static extern bool RegisterShellHookWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern bool DeregisterShellHookWindow(IntPtr hwnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int RegisterWindowMessageW(string name);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint attach, uint to, bool doAttach);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
@@ -106,6 +110,29 @@ namespace WeztermQuickTerminal
         }
 
         public static void Info(string message) { Write("INFO ", message); }
+
+        /// <summary>For the log: "0x1234 pid=42 chrome [Chrome_WidgetWin_1] "title" visible".</summary>
+        public static string Describe(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return "(none)";
+            try
+            {
+                uint pid;
+                N.GetWindowThreadProcessId(hwnd, out pid);
+                string name = "?";
+                try { using (Process p = Process.GetProcessById((int)pid)) name = p.ProcessName; } catch { }
+                var cls = new StringBuilder(256);
+                N.GetClassNameW(hwnd, cls, cls.Capacity);
+                var title = new StringBuilder(256);
+                N.GetWindowTextW(hwnd, title, title.Capacity);
+                return "0x" + hwnd.ToInt64().ToString("X") + " pid=" + pid + " " + name + " [" + cls + "] \"" + title + "\""
+                    + (N.IsWindowVisible(hwnd) ? " visible" : " HIDDEN");
+            }
+            catch (Exception ex)
+            {
+                return "0x" + hwnd.ToInt64().ToString("X") + " (" + ex.Message + ")";
+            }
+        }
         public static void Error(string message) { Write("ERROR", message); }
 
         private static void Write(string level, string message)
@@ -438,6 +465,9 @@ namespace WeztermQuickTerminal
                 if (fgPid == termPid) return;
             }
             Hide(hwnd);
+            _handoffTarget = foreground;
+            _hiddenOnFocusLossAt = DateTime.UtcNow;
+            WatchForegroundAfterHide(hwnd);
         }
 
         public void Relayout()
@@ -542,6 +572,60 @@ namespace WeztermQuickTerminal
         {
             SaveHeight(hwnd);
             N.ShowWindow(hwnd, N.SW_HIDE);
+        }
+
+        /// <summary>The window whose activation made us hide the drop-down.</summary>
+        private IntPtr _handoffTarget;
+        private DateTime _hiddenOnFocusLossAt = DateTime.MinValue;
+
+        /// <summary>
+        /// An app launched from WSL (e.g. a browser opening a URL) can get the foreground for a moment and then lose
+        /// it again: Windows hands it back to the drop-down, now hidden, and flashes the app's taskbar button instead.
+        /// Keys would then go to an invisible terminal (Ctrl+W closing it). Watch for that briefly after each hide.
+        /// </summary>
+        private void WatchForegroundAfterHide(IntPtr dropDown)
+        {
+            int[] delays = { 50, 200, 600, 1500 };
+            foreach (int delay in delays)
+            {
+                int d = delay;
+                var t = new System.Windows.Forms.Timer();
+                t.Interval = d;
+                t.Tick += delegate
+                {
+                    t.Stop();
+                    t.Dispose();
+                    FixHiddenForeground(dropDown, _handoffTarget);
+                };
+                t.Start();
+            }
+        }
+
+        /// <summary>Taskbar flash = an app was refused the foreground. If the hidden drop-down kept it, pass it on.</summary>
+        public void OnShellFlash(IntPtr flashing)
+        {
+            // Only right after a focus-loss hide; an unrelated notification flash must not steal focus.
+            if ((DateTime.UtcNow - _hiddenOnFocusLossAt).TotalSeconds > 3) return;
+            IntPtr hwnd = Locate();
+            if (hwnd != IntPtr.Zero) FixHiddenForeground(hwnd, flashing);
+        }
+
+        /// <summary>If the hidden drop-down is the foreground window, give the foreground to target (or show the drop-down again).</summary>
+        private void FixHiddenForeground(IntPtr dropDown, IntPtr target)
+        {
+            if (N.GetForegroundWindow() != dropDown || N.IsWindowVisible(dropDown) || !IsDropDown(dropDown)) return;
+            if (target != IntPtr.Zero && target != dropDown && N.IsWindow(target) && N.IsWindowVisible(target))
+            {
+                Focus(target);
+                if (N.GetForegroundWindow() != dropDown)
+                {
+                    Log.Info("Hidden quick terminal had the foreground; handed it to " + Log.Describe(target));
+                    return;
+                }
+            }
+            // Couldn't move it: show the drop-down again rather than let keys go to an invisible window.
+            Log.Info("Hidden quick terminal had the foreground; showing it again");
+            Show(dropDown);
         }
 
         private void Layout(IntPtr hwnd, uint flags, Monitors.Info mon)
@@ -650,10 +734,19 @@ namespace WeztermQuickTerminal
             CreateHandle(cp);
         }
 
+        /// <summary>Registered "SHELLHOOK" message id (0 = not registered).</summary>
+        public int ShellHookMsg;
+
         protected override void WndProc(ref Message m)
         {
             try
             {
+                if (ShellHookMsg != 0 && m.Msg == ShellHookMsg)
+                {
+                    int code = m.WParam.ToInt32() & 0xFFFF;
+                    if (code == 0x8006) // HSHELL_FLASH _app.Term.OnShellFlash(m.LParam);
+                    return;
+                }
                 switch (m.Msg)
                 {
                     case N.WM_HOTKEY: _app.Term.Toggle(); return;
@@ -802,6 +895,10 @@ namespace WeztermQuickTerminal
             _hook = N.SetWinEventHook(N.EVENT_SYSTEM_FOREGROUND, N.EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _hookProc,
                 0, 0, N.WINEVENT_OUTOFCONTEXT | N.WINEVENT_SKIPOWNPROCESS);
 
+            // Taskbar-flash notifications: see Controller.OnShellFlash.
+            _window.ShellHookMsg = N.RegisterWindowMessageW("SHELLHOOK");
+            if (!N.RegisterShellHookWindow(_window.Handle)) _window.ShellHookMsg = 0;
+
             _settingsTimer.Interval = 300;
             _settingsTimer.Tick += delegate { _settingsTimer.Stop(); ReloadSettings(); };
             WatchSettings();
@@ -904,6 +1001,7 @@ namespace WeztermQuickTerminal
             Log.Info("Helper " + _version + (release ? " quitting" : " handing over"));
             if (_watcher != null) _watcher.Dispose();
             if (_hook != IntPtr.Zero) N.UnhookWinEvent(_hook);
+            if (_window.ShellHookMsg != 0) N.DeregisterShellHookWindow(_window.Handle);
             if (release) Term.Release();
             N.UnregisterHotKey(_window.Handle, HotkeyId);
             _window.DestroyHandle();
